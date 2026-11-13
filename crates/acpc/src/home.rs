@@ -58,6 +58,7 @@ metrics_exporter = "none"
 [tui]
 show_tooltips = false
 show_server_version_notice = false
+status_line = ["context-used", "five-hour-limit", "weekly-limit", "model-with-reasoning", "approval-mode", "git-branch", "current-dir"]
 
 [tui.effects]
 welcome = false

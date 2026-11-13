@@ -123,9 +123,13 @@ pub(crate) fn session_config_updated(thread: &ThreadState, emit: &mut Emit) {
         .filter(|option| !hidden.contains(&option.id))
         .filter_map(config_option)
         .collect();
-    // Legacy modes only when the agent has no config options (they would
-    // otherwise duplicate the `mode` category).
-    let modes = if thread.config_options.is_empty() {
+    // Older agents can expose legacy modes alongside model and effort options.
+    let modes = if models::option_by_category(
+        &thread.config_options,
+        &acp::SessionConfigOptionCategory::Mode,
+    )
+    .is_none()
+    {
         thread.modes.as_ref().map(|modes| AcpcSessionModes {
             current_mode_id: modes.current_mode_id.to_string(),
             available: modes
@@ -144,6 +148,10 @@ pub(crate) fn session_config_updated(thread: &ThreadState, emit: &mut Emit) {
     emit.push(ServerNotification::AcpcSessionConfigUpdated(
         AcpcSessionConfigUpdatedNotification {
             thread_id: thread.id.clone(),
+            model_display_name: models::model_display_name(
+                &thread.config_options,
+                thread.reported_model.as_deref(),
+            ),
             options,
             modes,
         },
@@ -194,6 +202,9 @@ pub(crate) fn thread_state(bridge: &Bridge, thread: &ThreadState) {
     let mut emit = Vec::new();
     session_config_updated(thread, &mut emit);
     commands_updated(thread, &mut emit);
+    if let Some(snapshot) = &thread.claude_limits {
+        emit.push(crate::threads::limits_updated(snapshot));
+    }
     if let Some((used, size)) = thread.usage {
         let turn_id = thread
             .active

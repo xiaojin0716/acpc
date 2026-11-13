@@ -280,6 +280,7 @@ async fn run(cli: Cli, config: Config, home: Home, env_restore: EnvRestore) -> a
         main_execve_wrapper_exe: None,
     };
     codex_tui::acpc::enable();
+    codex_tui::acpc::set_compact_tool_calls(config.compact_tool_calls);
     let exit = codex_tui::run_main(
         tui_cli,
         arg0,

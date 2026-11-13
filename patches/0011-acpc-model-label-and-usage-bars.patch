@@ -1,0 +1,134 @@
+From: Local acpc build <local@localhost>
+Subject: [PATCH] acpc: show usage bars above the full session model name
+
+---
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/acpc.rs b/codex-rs/app-server-protocol/src/protocol/v2/acpc.rs
+--- a/codex-rs/app-server-protocol/src/protocol/v2/acpc.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/acpc.rs
+@@ -99,6 +99,10 @@
+ #[ts(export_to = "v2/")]
+ pub struct AcpcSessionConfigUpdatedNotification {
+     pub thread_id: String,
++    /// Agent-reported display name or concrete model ID for the status line.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional)]
++    pub model_display_name: Option<String>,
+     pub options: Vec<AcpcSessionConfigOption>,
+     #[serde(default)]
+     pub modes: Option<AcpcSessionModes>,
+diff --git a/codex-rs/tui/src/acpc.rs b/codex-rs/tui/src/acpc.rs
+--- a/codex-rs/tui/src/acpc.rs
++++ b/codex-rs/tui/src/acpc.rs
+@@ -51,6 +51,7 @@
+ /// ACP state mirrored from the bridge for the current session.
+ #[derive(Debug, Default)]
+ pub(crate) struct AcpcChatState {
++    pub(crate) model_display_name: Option<String>,
+     pub(crate) agents: Vec<codex_app_server_protocol::AcpcAgent>,
+     pub(crate) current_agent: Option<String>,
+     pub(crate) commands: Vec<codex_app_server_protocol::AcpcAvailableCommand>,
+diff --git a/codex-rs/tui/src/chatwidget/acpc.rs b/codex-rs/tui/src/chatwidget/acpc.rs
+--- a/codex-rs/tui/src/chatwidget/acpc.rs
++++ b/codex-rs/tui/src/chatwidget/acpc.rs
+@@ -40,6 +40,7 @@
+                 self.bottom_pane.set_agent_commands(commands);
+             }
+             ServerNotification::AcpcSessionConfigUpdated(notification) => {
++                self.acpc.model_display_name = notification.model_display_name;
+                 self.acpc.options = notification.options;
+                 self.acpc.modes = notification.modes;
+                 self.refresh_status_line();
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -223,13 +223,16 @@
+             self.status_line_pull_request_url(),
+         );
+         // Keep both budgets visible even when the local checkout has a long path.
++        let usage = |item: StatusLineItem| matches!(
++            item, StatusLineItem::ContextUsed | StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit
++        );
+         if crate::acpc::enabled()
+-            && let Some(index) = segments.iter().position(|(item, _)| *item == StatusLineItem::ContextUsed)
+-            && index > 0
++            && let Some((first, _)) = segments.first()
++            && let Some(index) = segments.iter().position(|(item, _)| usage(*item) != usage(*first))
+         {
+-            let usage = segments.split_off(index);
+-            let rows = render(segments).zip(render(usage)).map(|(session, usage)| {
+-                crate::bottom_pane::footer_content::FooterContent::Rows([session, usage])
++            let second = segments.split_off(index);
++            let rows = render(segments).zip(render(second)).map(|(top, bottom)| {
++                crate::bottom_pane::footer_content::FooterContent::Rows([top, bottom])
+             });
+             self.set_status_line(rows);
+         } else {
+@@ -747,7 +750,8 @@
+             StatusLineItem::ModelWithReasoning if crate::acpc::enabled() => {
+                 let effort = self.current_collaboration_mode.reasoning_effort();
+                 let effort = effort.as_ref().map_or("—", |value| value.as_str());
+-                Some(format!("{} · effort {effort}", self.model_display_name()))
++                let model = self.acpc.model_display_name.as_deref().unwrap_or_else(|| self.model_display_name());
++                Some(format!("{model} · effort {effort}"))
+             }
+             StatusLineItem::ApprovalMode if crate::acpc::enabled() => {
+                 Some(format!("mode {}", self.acpc_current_mode().unwrap_or("—")))
+@@ -810,7 +814,7 @@
+                     let used = info.last_token_usage.total_tokens;
+                     Some((100.0 * used as f64 / size as f64).clamp(0.0, 100.0))
+                 });
+-                Some(percent.map_or_else(|| "Ctx —".into(), |p| format!("Ctx {p:.0}%")))
++                Some(percent.map_or_else(|| "Ctx —".into(), |p| format!("Ctx {}", compact_usage(p))))
+             }
+             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit if crate::acpc::enabled() => {
+                 let snapshot = self.thread_id.and_then(|id| {
+@@ -823,8 +827,8 @@
+                 };
+                 Some(match window {
+                     Some(window) => format!(
+-                        "{label} {:.0}% ↻ {}",
+-                        window.used_percent,
++                        "{label} {} ↻ {}",
++                        compact_usage(window.used_percent),
+                         window.resets_at.as_deref().unwrap_or("—"),
+                     ),
+                     None => format!("{label} —"),
+@@ -1190,6 +1194,18 @@
+     }
+ }
+ 
++/// Five terminal cells, with eighth-cell precision so small usage changes stay visible.
++fn compact_usage(percent: f64) -> String {
++    const BLOCKS: [char; 9] = ['░', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
++    const CELLS: usize = 5;
++    let percent = percent.clamp(0.0, 100.0);
++    let filled = (percent * (CELLS * 8) as f64 / 100.0).round() as usize;
++    let bar: String = (0..CELLS)
++        .map(|cell| BLOCKS[filled.saturating_sub(cell * 8).min(8)])
++        .collect();
++    format!("{percent:.0}% {bar}")
++}
++
+ fn five_hour_status_window(
+     snapshot: &RateLimitSnapshotDisplay,
+ ) -> Option<(&RateLimitWindowDisplay, bool)> {
+diff --git a/codex-rs/tui/src/status/rate_limits.rs b/codex-rs/tui/src/status/rate_limits.rs
+--- a/codex-rs/tui/src/status/rate_limits.rs
++++ b/codex-rs/tui/src/status/rate_limits.rs
+@@ -86,8 +86,14 @@
+             .resets_at
+             .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+             .map(|dt| dt.with_timezone(&Local));
+-        let resets_at =
+-            resets_at_utc.map(|dt| format_reset_timestamp(dt, captured_at, clock_format));
++        let resets_at = resets_at_utc.map(|dt| {
++            if crate::acpc::enabled() {
++                let format = if dt.date_naive() == captured_at.date_naive() { "%H:%M" } else { "%m/%d %H:%M" };
++                dt.format(format).to_string()
++            } else {
++                format_reset_timestamp(dt, captured_at, clock_format)
++            }
++        });
+ 
+         Self {
+             used_percent: f64::from(window.used_percent),

@@ -1,0 +1,133 @@
+From: Local acpc build <local@localhost>
+Subject: [PATCH] acpc: fold successful tool calls in the main transcript
+
+---
+diff --git a/codex-rs/tui/src/acpc.rs b/codex-rs/tui/src/acpc.rs
+--- a/codex-rs/tui/src/acpc.rs
++++ b/codex-rs/tui/src/acpc.rs
+@@ -8,6 +8,16 @@
+ use std::sync::atomic::Ordering;
+ 
+ static ENABLED: AtomicBool = AtomicBool::new(false);
++
++static COMPACT_TOOL_CALLS: AtomicBool = AtomicBool::new(false);
++
++pub fn set_compact_tool_calls(enabled: bool) {
++    COMPACT_TOOL_CALLS.store(enabled, Ordering::Relaxed);
++}
++
++pub(crate) fn compact_tool_calls() -> bool {
++    COMPACT_TOOL_CALLS.load(Ordering::Relaxed)
++}
+ 
+ /// Turn on acpc behaviour for this process. Call before `run_main`.
+ pub fn enable() {
+diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
+--- a/codex-rs/tui/src/history_cell/mod.rs
++++ b/codex-rs/tui/src/history_cell/mod.rs
+@@ -258,6 +258,12 @@
+         }
+     }
+ 
++    /// Successful tool calls that may share a compact ACP transcript row.
++    /// Running tools, failures, approvals and ordinary messages remain visible.
++    fn completed_tool_count(&self) -> usize {
++        0
++    }
++
+     /// Stable, namespaced member identities used to retain disclosure across grouping and replay.
+     /// Empty identities indicate ordinary content without a local disclosure control.
+     fn activity_ids(&self) -> Vec<String> {
+diff --git a/codex-rs/tui/src/exec_cell/render.rs b/codex-rs/tui/src/exec_cell/render.rs
+--- a/codex-rs/tui/src/exec_cell/render.rs
++++ b/codex-rs/tui/src/exec_cell/render.rs
+@@ -210,6 +210,15 @@
+ }
+ 
+ impl HistoryCell for ExecCell {
++    fn completed_tool_count(&self) -> usize {
++        if !self.iter_calls().all(|call| !call.is_user_shell_command()
++            && call.output.as_ref().is_some_and(|out| out.exit_code == 0))
++        {
++            return 0;
++        }
++        self.group.calls.len()
++    }
++
+     fn append_reasoning(&mut self, cell: Box<dyn HistoryCell>) -> Result<(), Box<dyn HistoryCell>> {
+         if self.is_exploring_cell() {
+             self.group.push_detail(std::sync::Arc::from(cell));
+diff --git a/codex-rs/tui/src/history_cell/dynamic.rs b/codex-rs/tui/src/history_cell/dynamic.rs
+--- a/codex-rs/tui/src/history_cell/dynamic.rs
++++ b/codex-rs/tui/src/history_cell/dynamic.rs
+@@ -173,6 +173,11 @@
+ }
+ 
+ impl HistoryCell for DynamicToolCallCell {
++    fn completed_tool_count(&self) -> usize {
++        let data = self.data.read().unwrap_or_else(std::sync::PoisonError::into_inner);
++        usize::from(data.status == DynamicToolCallStatus::Completed)
++    }
++
+     fn has_stable_transcript_height(&self) -> bool {
+         false
+     }
+diff --git a/codex-rs/tui/src/history_cell/patches.rs b/codex-rs/tui/src/history_cell/patches.rs
+--- a/codex-rs/tui/src/history_cell/patches.rs
++++ b/codex-rs/tui/src/history_cell/patches.rs
+@@ -26,6 +26,10 @@
+ }
+ 
+ impl HistoryCell for PatchHistoryCell {
++    fn completed_tool_count(&self) -> usize {
++        1
++    }
++
+     fn activity_ids(&self) -> Vec<String> {
+         vec![self.activity_id.clone()]
+     }
+diff --git a/codex-rs/tui/src/history_cell/mcp.rs b/codex-rs/tui/src/history_cell/mcp.rs
+--- a/codex-rs/tui/src/history_cell/mcp.rs
++++ b/codex-rs/tui/src/history_cell/mcp.rs
+@@ -356,6 +356,10 @@
+ }
+ 
+ impl HistoryCell for McpToolCallCell {
++    fn completed_tool_count(&self) -> usize {
++        usize::from(self.success() == Some(true))
++    }
++
+     fn activity_ids(&self) -> Vec<String> {
+         vec![format!("mcp:{}", self.call_id)]
+     }
+diff --git a/codex-rs/tui/src/transcript_view/layout.rs b/codex-rs/tui/src/transcript_view/layout.rs
+--- a/codex-rs/tui/src/transcript_view/layout.rs
++++ b/codex-rs/tui/src/transcript_view/layout.rs
+@@ -237,6 +237,27 @@
+             return Some(Arc::new(TextLayout::new(Vec::new(), width)));
+         }
+         let mode = self.mode;
++        if crate::acpc::compact_tool_calls() && !self.detailed && !full_content && mode == HistoryRenderMode::Rich {
++            let count = cell.completed_tool_count();
++            if count > 0 && !self.disclosure.is_expanded(&cell.activity_ids()) {
++                // Keep the underlying cells intact for detailed view, search, history paging,
++                // and out-of-order tool completions. Only the first cell paints the summary.
++                let compact_count = |entry: &Arc<dyn HistoryCell>| {
++                    let n = entry.completed_tool_count();
++                    if n > 0 && self.disclosure.is_expanded(&entry.activity_ids()) { 0 } else { n }
++                };
++                if index > 0 && compact_count(&cells[index - 1]) > 0 {
++                    return Some(Arc::new(TextLayout::new(Vec::new(), width)));
++                }
++                let total = count + cells[index + 1..].iter().map(compact_count)
++                    .take_while(|&n| n > 0).sum::<usize>();
++                let noun = if total == 1 { "tool call" } else { "tool calls" };
++                let hint = self.disclosure.keymap.primary_hint(KeymapContext::Global, "open_transcript")
++                    .map(|key| format!(" · {} for details", key.display_label())).unwrap_or_default();
++                let line = Line::from(format!("› {total} {noun}{hint}").dim());
++                return Some(Arc::new(TextLayout::new(vec![line.into()], width)));
++            }
++        }
+         let mut presentation = self.content_presentation(cell.as_ref(), full_content, mode);
+         let shortcut = self
+             .disclosure

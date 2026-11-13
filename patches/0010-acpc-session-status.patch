@@ -1,0 +1,170 @@
+From: Local acpc build <local@localhost>
+Subject: [PATCH] acpc: show local branch and live session settings above usage
+
+---
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -216,13 +216,25 @@
+             }
+         }
+ 
+-        let line = status_line_from_segments(
+-            segments,
++        let render = |items| status_line_from_segments(
++            items,
+             self.local_settings.tui.status_line_use_colors,
+             self.thread_id,
+             self.status_line_pull_request_url(),
+         );
+-        self.set_status_line(line.map(Into::into));
++        // Keep both budgets visible even when the local checkout has a long path.
++        if crate::acpc::enabled()
++            && let Some(index) = segments.iter().position(|(item, _)| *item == StatusLineItem::ContextUsed)
++            && index > 0
++        {
++            let usage = segments.split_off(index);
++            let rows = render(segments).zip(render(usage)).map(|(session, usage)| {
++                crate::bottom_pane::footer_content::FooterContent::Rows([session, usage])
++            });
++            self.set_status_line(rows);
++        } else {
++            self.set_status_line(render(segments).map(Into::into));
++        }
+     }
+ 
+     /// Clears the terminal title Codex most recently wrote, if any.
+@@ -609,14 +621,22 @@
+         if self.status_line_branch_pending {
+             return;
+         }
+-        let Some(runner) = self.workspace_command_runner.clone() else {
++        let runner = self.workspace_command_runner.clone();
++        let local = crate::acpc::enabled();
++        if !local && runner.is_none() {
+             self.status_line_branch_lookup_complete = true;
+             return;
+-        };
++        }
+         self.status_line_branch_pending = true;
+         let tx = self.app_event_tx.clone();
+         tokio::spawn(async move {
+-            let branch = branch_summary::current_branch_name(runner.as_ref(), &cwd).await;
++            let branch = if local {
++                codex_git_utils::current_branch_name(&cwd).await
++            } else if let Some(runner) = runner {
++                branch_summary::current_branch_name(runner.as_ref(), &cwd).await
++            } else {
++                None
++            };
+             tx.send(AppEvent::StatusLineBranchUpdated { cwd, branch });
+         });
+     }
+@@ -724,6 +744,14 @@
+     pub(super) fn status_line_value_for_item(&mut self, item: StatusLineItem) -> Option<String> {
+         match item {
+             StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
++            StatusLineItem::ModelWithReasoning if crate::acpc::enabled() => {
++                let effort = self.current_collaboration_mode.reasoning_effort();
++                let effort = effort.as_ref().map_or("—", |value| value.as_str());
++                Some(format!("{} · effort {effort}", self.model_display_name()))
++            }
++            StatusLineItem::ApprovalMode if crate::acpc::enabled() => {
++                Some(format!("mode {}", self.acpc_current_mode().unwrap_or("—")))
++            }
+             StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_name()),
+             StatusLineItem::Reasoning => Some(self.reasoning_display_name()),
+             StatusLineItem::Profile => {
+diff --git a/codex-rs/tui/src/chatwidget/acpc.rs b/codex-rs/tui/src/chatwidget/acpc.rs
+--- a/codex-rs/tui/src/chatwidget/acpc.rs
++++ b/codex-rs/tui/src/chatwidget/acpc.rs
+@@ -42,6 +42,7 @@
+             ServerNotification::AcpcSessionConfigUpdated(notification) => {
+                 self.acpc.options = notification.options;
+                 self.acpc.modes = notification.modes;
++                self.refresh_status_line();
+             }
+             ServerNotification::AcpcAgentsUpdated(notification) => {
+                 self.acpc.agents = notification.agents;
+@@ -143,6 +144,15 @@
+             option.category.as_deref() == Some("mode")
+                 && matches!(option.kind, AcpcSessionConfigKind::Select { .. })
+         })
++    }
++
++    pub(super) fn acpc_current_mode(&self) -> Option<&str> {
++        if let Some(option) = self.acpc_mode_option()
++            && let AcpcSessionConfigKind::Select { current_value, .. } = &option.kind
++        {
++            return Some(current_value.as_str());
++        }
++        self.acpc.modes.as_ref().map(|modes| modes.current_mode_id.as_str())
+     }
+ 
+     pub(crate) fn open_acpc_options(&mut self) {
+diff --git a/codex-rs/tui/src/bottom_pane/footer/footer_content.rs b/codex-rs/tui/src/bottom_pane/footer/footer_content.rs
+--- a/codex-rs/tui/src/bottom_pane/footer/footer_content.rs
++++ b/codex-rs/tui/src/bottom_pane/footer/footer_content.rs
+@@ -18,6 +18,7 @@
+ pub(crate) enum FooterContent {
+     Line(Line<'static>),
+     HyperlinkLine(HyperlinkLine),
++    Rows([HyperlinkLine; 2]),
+     Extension { content: Arc<PreparedUiTree> },
+ }
+ 
+@@ -35,6 +36,7 @@
+         let width = match self {
+             Self::Line(line) => line.width(),
+             Self::HyperlinkLine(line) => line.width(),
++            Self::Rows([first, second]) => first.width().max(second.width()),
+             Self::Extension { content } => return content.measure_natural().width,
+         };
+         u16::try_from(width).unwrap_or(u16::MAX)
+@@ -46,6 +48,12 @@
+             Self::Line(line) => Widget::render(line, area, buf),
+             Self::Extension { content } => {
+                 with_syntax_theme(|theme| content.render(area, theme, buf));
++            }
++            Self::Rows(rows) => {
++                for (row, line) in rows.into_iter().take(usize::from(area.height)).enumerate() {
++                    let row_area = Rect { y: area.y + row as u16, height: 1, ..area };
++                    Self::HyperlinkLine(line).render(row_area, buf);
++                }
+             }
+             Self::HyperlinkLine(mut line) => {
+                 let area = Rect {
+@@ -66,7 +74,7 @@
+     pub(crate) fn into_hyperlink_line(self) -> HyperlinkLine {
+         match self {
+             Self::Line(line) => line.into(),
+-            Self::HyperlinkLine(line) => line,
++            Self::HyperlinkLine(line) | Self::Rows([line, _]) => line,
+             Self::Extension { content } => {
+                 with_syntax_theme(|theme| content.render_line(u16::MAX, theme))
+             }
+diff --git a/codex-rs/tui/src/bottom_pane/footer.rs b/codex-rs/tui/src/bottom_pane/footer.rs
+--- a/codex-rs/tui/src/bottom_pane/footer.rs
++++ b/codex-rs/tui/src/bottom_pane/footer.rs
+@@ -830,7 +830,7 @@
+     let mut line = match status {
+         Some(FooterContent::Line(line)) => HyperlinkLine::from(line.clone()),
+         Some(FooterContent::HyperlinkLine(line)) => line.clone(),
+-        Some(content @ FooterContent::Extension { .. }) => return Some(content.clone()),
++        Some(content @ (FooterContent::Rows(_) | FooterContent::Extension { .. })) => return Some(content.clone()),
+         None => HyperlinkLine::default(),
+     };
+     let suffix = passive_footer_suffix(props, status.is_some());
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/status_surface.rs b/codex-rs/tui/src/bottom_pane/chat_composer/status_surface.rs
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/status_surface.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/status_surface.rs
+@@ -64,6 +64,9 @@
+         // The unfocused composer paints one dim status line.
+         if options.unfocused {
+             return 1;
++        }
++        if let Some(FooterContent::Rows(rows)) = &self.footer.status_line_value {
++            return rows.len() as u16;
+         }
+         let Some(FooterContent::Extension { content }) = &self.footer.status_line_value else {
+             return 1;

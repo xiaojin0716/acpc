@@ -48,6 +48,81 @@ pub(crate) fn current_value(option: &acp::SessionConfigOption) -> Option<String>
     }
 }
 
+/// The selected ACP entry supplies the label even before the first model response.
+pub(crate) fn selected_model(
+    options: &[acp::SessionConfigOption],
+) -> Option<&acp::SessionConfigSelectOption> {
+    let model = option_by_category(options, &acp::SessionConfigOptionCategory::Model)?;
+    let id = current_value(model)?;
+    select_values(model)
+        .into_iter()
+        .find(|value| value.value.to_string() == id)
+}
+
+/// Convert versioned Claude wire IDs to a label. Preserve unfamiliar IDs verbatim.
+fn model_title(id: &str) -> String {
+    let Some(parts) = id.strip_prefix("claude-") else {
+        return id.to_owned();
+    };
+    let mut parts: Vec<_> = parts.split('-').collect();
+    if parts
+        .last()
+        .is_some_and(|part| part.len() == 8 && part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        parts.pop();
+    }
+    let (family, version) = match parts.as_slice() {
+        [family @ ("opus" | "sonnet" | "haiku"), version @ ..] => (family, version),
+        [version @ .., family @ ("opus" | "sonnet" | "haiku")] => (family, version),
+        _ => return id.to_owned(),
+    };
+    let version = version.join(".");
+    let numbers: Vec<_> = version.split('.').collect();
+    if !(1..=2).contains(&numbers.len()) || !numbers.iter().all(|part| part.parse::<u16>().is_ok())
+    {
+        return id.to_owned();
+    }
+    let name = match *family {
+        "opus" => "Opus",
+        "sonnet" => "Sonnet",
+        _ => "Haiku",
+    };
+    format!("Claude {name} {version}")
+}
+
+pub(crate) fn model_display_name(
+    options: &[acp::SessionConfigOption],
+    reported: Option<&str>,
+) -> Option<String> {
+    let entry = selected_model(options);
+    let resolved = entry
+        .and_then(|value| value.meta.as_ref())
+        .and_then(|meta| meta.get("_claude/resolvedModel"))
+        .and_then(|value| value.as_str())
+        .filter(|id| !id.is_empty());
+    let actual = reported.filter(|id| {
+        !matches!(
+            id.split('[').next(),
+            Some("default" | "opus" | "sonnet" | "haiku")
+        )
+    });
+    if let Some(id) = actual.or(resolved) {
+        return Some(model_title(id));
+    }
+    if let Some(entry) = entry {
+        let id = entry.value.to_string();
+        let label = entry.name.trim();
+        return Some(model_title(
+            if id.starts_with("claude-") || label.is_empty() {
+                &id
+            } else {
+                label
+            },
+        ));
+    }
+    reported.map(model_title)
+}
+
 /// The model id the TUI should show as current.
 pub(crate) fn current_model(options: &[acp::SessionConfigOption]) -> String {
     option_by_category(options, &acp::SessionConfigOptionCategory::Model)

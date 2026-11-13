@@ -448,9 +448,10 @@ fn settings_update(
             if let Some(options) = options
                 && let Some(thread) = bridge.threads.get_mut(&thread_id)
             {
-                thread.config_options = options;
-                let notification = threads::settings_updated(thread, bridge.options.yolo);
-                bridge.notify(notification);
+                thread.set_config_options(options);
+                let mut emit = vec![threads::settings_updated(thread, bridge.options.yolo)];
+                crate::ext::session_config_updated(thread, &mut emit);
+                threads::emit_all(bridge, emit);
             }
             match error {
                 Some(message) => bridge.respond_error(conn, id, INTERNAL_ERROR, message),
@@ -491,7 +492,7 @@ fn set_config_option(
         move |bridge: &mut Bridge| match result {
             Ok(response) => {
                 if let Some(thread) = bridge.threads.get_mut(&thread_id) {
-                    thread.config_options = response.config_options;
+                    thread.set_config_options(response.config_options);
                 }
                 bridge.respond(
                     conn,

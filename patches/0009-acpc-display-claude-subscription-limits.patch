@@ -1,0 +1,57 @@
+From: Local acpc build <local@localhost>
+Subject: [PATCH] acpc: display context and Claude subscription usage in status line
+
+---
+diff --git a/codex-rs/tui/src/chatwidget/rate_limits.rs b/codex-rs/tui/src/chatwidget/rate_limits.rs
+index a7162b9..758962f 100644
+--- a/codex-rs/tui/src/chatwidget/rate_limits.rs
++++ b/codex-rs/tui/src/chatwidget/rate_limits.rs
+@@ -376,7 +376,10 @@ impl ChatWidget {
+ 
+             // /wham/usage identifies ordinary and additional model limits separately. Streamed
+             // updates still drive warnings/recovery above, but must not overwrite status data.
+-            if matches!(source, RateLimitSnapshotSource::AccountUsage) {
++            // acpc delivers complete Claude usage reads over account/rateLimits/updated.
++            if matches!(source, RateLimitSnapshotSource::AccountUsage)
++                || (crate::acpc::enabled() && limit_id.starts_with("claude-"))
++            {
+                 let limit_label = snapshot
+                     .limit_name
+                     .clone()
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 00822bd..2621cf9 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -776,6 +776,32 @@ impl ChatWidget {
+             StatusLineItem::ContextRemaining => self
+                 .status_line_context_remaining_percent()
+                 .map(|remaining| format!("Context {remaining}% left")),
++            StatusLineItem::ContextUsed if crate::acpc::enabled() => {
++                let percent = self.token_info.as_ref().and_then(|info| {
++                    let size = info.model_context_window.filter(|size| *size > 0)?;
++                    let used = info.last_token_usage.total_tokens;
++                    Some((100.0 * used as f64 / size as f64).clamp(0.0, 100.0))
++                });
++                Some(percent.map_or_else(|| "Ctx —".into(), |p| format!("Ctx {p:.0}%")))
++            }
++            StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit if crate::acpc::enabled() => {
++                let snapshot = self.thread_id.and_then(|id| {
++                    self.rate_limit_snapshots_by_limit_id.get(&format!("claude-{id}"))
++                });
++                let (label, window) = if matches!(item, StatusLineItem::FiveHourLimit) {
++                    ("5h", snapshot.and_then(|s| s.primary.as_ref()))
++                } else {
++                    ("7d", snapshot.and_then(|s| s.secondary.as_ref()))
++                };
++                Some(match window {
++                    Some(window) => format!(
++                        "{label} {:.0}% ↻ {}",
++                        window.used_percent,
++                        window.resets_at.as_deref().unwrap_or("—"),
++                    ),
++                    None => format!("{label} —"),
++                })
++            }
+             StatusLineItem::ContextUsed => self
+                 .status_line_context_used_percent()
+                 .map(|used| format!("Context {used}% used")),

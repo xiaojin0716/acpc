@@ -8,7 +8,10 @@ use acp_client::AgentEvent;
 use acp_client::LoadId;
 use acp_client::PromptId;
 use acp_client::schema as acp;
+use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
 use codex_app_server_protocol::ErrorNotification;
+use codex_app_server_protocol::RateLimitSnapshot;
+use codex_app_server_protocol::RateLimitWindow;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
@@ -77,6 +80,8 @@ pub(crate) struct ThreadState {
     pub(crate) active: Option<ActiveTurn>,
     pub(crate) replay: Option<Replay>,
     pub(crate) usage: Option<(u64, u64)>,
+    pub(crate) reported_model: Option<String>,
+    pub(crate) claude_limits: Option<RateLimitSnapshot>,
     pub(crate) image_input: bool,
     pub(crate) agent_name: String,
     /// Sent with the first prompt, then cleared.
@@ -105,6 +110,8 @@ impl ThreadState {
             active: None,
             replay: None,
             usage: None,
+            reported_model: None,
+            claude_limits: None,
             image_input: false,
             agent_name,
             handoff: None,
@@ -120,13 +127,20 @@ impl ThreadState {
         models::current_effort(&self.config_options)
     }
 
+    pub(crate) fn set_config_options(&mut self, options: Vec<acp::SessionConfigOption>) {
+        if models::selected_model(&self.config_options) != models::selected_model(&options) {
+            self.reported_model = None;
+        }
+        self.config_options = options;
+    }
+
     pub(crate) fn apply_session_setup(
         &mut self,
         config_options: Option<Vec<acp::SessionConfigOption>>,
         modes: Option<acp::SessionModeState>,
     ) {
         if let Some(options) = config_options {
-            self.config_options = options;
+            self.set_config_options(options);
         }
         if modes.is_some() {
             self.modes = modes;
@@ -270,7 +284,7 @@ fn on_session_update(bridge: &mut Bridge, agent: &str, notification: acp::Sessio
             return;
         }
         acp::SessionUpdate::ConfigOptionUpdate(update) => {
-            thread.config_options = update.config_options.clone();
+            thread.set_config_options(update.config_options.clone());
             emit.push(settings_updated(thread, bridge.options.yolo));
             crate::ext::session_config_updated(thread, &mut emit);
             emit_all(bridge, emit);
@@ -285,10 +299,22 @@ fn on_session_update(bridge: &mut Bridge, agent: &str, notification: acp::Sessio
             return;
         }
         acp::SessionUpdate::SessionInfoUpdate(update) => {
+            if let Some(limits) = update
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("_claude/subscriptionLimits"))
+            {
+                let snapshot = claude_limits(&thread_id, limits);
+                emit.push(limits_updated(&snapshot));
+                thread.claude_limits = Some(snapshot);
+            }
             match &update.title {
                 acp_client::MaybeUndefined::Value(title) => thread.title = Some(title.clone()),
                 acp_client::MaybeUndefined::Null => thread.title = None,
-                acp_client::MaybeUndefined::Undefined => return,
+                acp_client::MaybeUndefined::Undefined => {
+                    emit_all(bridge, emit);
+                    return;
+                }
             }
             emit.push(ServerNotification::ThreadNameUpdated(
                 ThreadNameUpdatedNotification {
@@ -301,6 +327,20 @@ fn on_session_update(bridge: &mut Bridge, agent: &str, notification: acp::Sessio
         }
         acp::SessionUpdate::UsageUpdate(update) => {
             thread.usage = Some((update.used, update.size));
+            if let Some(model) = update
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("_claude/model"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                && thread.reported_model.as_deref() != Some(model)
+            {
+                thread.reported_model = Some(model.to_owned());
+                if thread.replay.is_none() {
+                    crate::ext::session_config_updated(thread, &mut emit);
+                }
+            }
             let turn_id = thread
                 .active
                 .as_ref()
@@ -356,6 +396,45 @@ pub(crate) fn settings_updated(thread: &ThreadState, yolo: bool) -> ServerNotifi
     ServerNotification::ThreadSettingsUpdated(ThreadSettingsUpdatedNotification {
         thread_id: thread.id.clone(),
         thread_settings: records::thread_settings(thread, yolo),
+    })
+}
+
+/// Scope the account read to its ACP thread. Concurrent agents can use different accounts.
+fn claude_limits(thread_id: &str, limits: &serde_json::Value) -> RateLimitSnapshot {
+    let window = |name: &str, minutes| {
+        let value = limits.get(name)?;
+        let percent = value.get("utilization")?.as_f64()?;
+        if !(0.0..=100.0).contains(&percent) {
+            return None;
+        }
+        let resets_at = value
+            .get("resets_at")
+            .and_then(|value| value.as_str())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|time| time.timestamp());
+        Some(RateLimitWindow {
+            used_percent: percent.round() as i32,
+            window_duration_mins: Some(minutes),
+            resets_at,
+        })
+    };
+    RateLimitSnapshot {
+        limit_id: Some(format!("claude-{thread_id}")),
+        limit_name: Some("Claude".into()),
+        primary: window("five_hour", 300),
+        secondary: window("seven_day", 10080),
+        normal_model_slug: None,
+        credits: None,
+        individual_limit: None,
+        spend_control_reached: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    }
+}
+
+pub(crate) fn limits_updated(snapshot: &RateLimitSnapshot) -> ServerNotification {
+    ServerNotification::AccountRateLimitsUpdated(AccountRateLimitsUpdatedNotification {
+        rate_limits: snapshot.clone(),
     })
 }
 
@@ -669,9 +748,10 @@ pub(crate) fn start_turn(
                 return;
             };
             if let Some(options) = options {
-                thread.config_options = options;
-                let notification = settings_updated(thread, bridge.options.yolo);
-                bridge.notify(notification);
+                thread.set_config_options(options);
+                let mut emit = vec![settings_updated(thread, bridge.options.yolo)];
+                crate::ext::session_config_updated(thread, &mut emit);
+                emit_all(bridge, emit);
             }
             let Some(thread) = bridge.threads.get_mut(&thread_id_owned) else {
                 return;

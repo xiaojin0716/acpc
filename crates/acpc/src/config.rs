@@ -34,6 +34,9 @@ use serde::Deserialize;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Show adjacent successful tools as one summary in the main conversation.
+    #[serde(default)]
+    pub compact_tool_calls: bool,
     /// Slug of the agent used when `--agent` is not given.
     pub agent: Option<String>,
     /// Approve every agent permission request without asking (`--yolo`).
